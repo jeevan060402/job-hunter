@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║  Job Hunter — Daily Automated Pipeline for Jeevan Kumar     ║
-║  AI Engine : Google Gemini Flash (100% FREE)                ║
+║  AI Engine : Groq (Llama 3.3-70b) — 100% FREE              ║
 ║  Schedule  : 9:30 AM IST via GitHub Actions cron            ║
 ║  Sources   : Remotive · RemoteOK · Arbeitnow · Naukri RSS   ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -17,19 +17,20 @@ import requests
 import logging
 import sys
 import re
+import feedparser                          # replaces broken xml.etree for Naukri
+from groq import Groq                      # replaces google.generativeai
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import List, Dict
 from pathlib import Path
 
-import google.generativeai as genai
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
 CONFIG = {
-    # Free Gemini API key — get from https://aistudio.google.com (no card needed)
-    "gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
+    # Free Groq API key — get from https://console.groq.com (no card needed)
+    "groq_api_key": os.getenv("GROQ_API_KEY", ""),
 
     # Gmail settings — use an App Password, not your account password
     # Create one at: https://myaccount.google.com/apppasswords
@@ -58,6 +59,7 @@ CONFIG = {
         "angular developer", "data scientist", "machine learning engineer",
     ],
 }
+
 
 # ─────────────────────────────────────────────
 # CANDIDATE PROFILE + SCORING PROMPT
@@ -254,8 +256,7 @@ def fetch_arbeitnow() -> List[Dict]:
 
 
 def fetch_naukri_rss() -> List[Dict]:
-    """Naukri RSS — India-focused Python + DevOps listings."""
-    import xml.etree.ElementTree as ET
+    """Naukri RSS — uses feedparser which tolerates Naukri's malformed XML."""
     jobs = []
     feeds = [
         "https://www.naukri.com/rss/jobs/python-developer-jobs-in-hyderabad.rss",
@@ -263,32 +264,26 @@ def fetch_naukri_rss() -> List[Dict]:
         "https://www.naukri.com/rss/jobs/python-developer-jobs-in-india.rss",
         "https://www.naukri.com/rss/jobs/kubernetes-engineer-jobs-in-india.rss",
     ]
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
     for url in feeds:
         try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code != 200:
-                continue
-            root = ET.fromstring(r.content)
-            channel = root.find("channel")
-            if channel is None:
-                continue
-            for item in channel.findall("item")[:8]:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:8]:
                 jobs.append({
                     "source":      "Naukri",
-                    "title":       item.findtext("title", ""),
-                    "company":     "",
+                    "title":       entry.get("title", ""),
+                    "company":     entry.get("author", ""),
                     "location":    "India",
-                    "url":         item.findtext("link", ""),
-                    "description": _clean(item.findtext("description", ""), 600),
+                    "url":         entry.get("link", ""),
+                    "description": _clean(entry.get("summary", ""), 600),
                     "tags":        "",
                     "salary":      "",
-                    "posted":      item.findtext("pubDate", ""),
+                    "posted":      entry.get("published", ""),
                 })
+            log.info(f"Naukri [{url.split('/')[-1]}]: {len(feed.entries)} entries")
             time.sleep(1)
         except Exception as e:
             log.warning(f"Naukri RSS {url}: {e}")
-    log.info(f"Naukri RSS: {len(jobs)} listings")
+    log.info(f"Naukri total: {len(jobs)} jobs")
     return jobs
 
 
@@ -304,7 +299,11 @@ def filter_jobs(jobs: List[Dict]) -> List[Dict]:
             continue
         seen.add(url)
 
-        hay = (j.get("title", "") + " " + j.get("description", "") + " " + j.get("tags", "")).lower()
+        hay = (
+            j.get("title", "") + " " +
+            j.get("description", "") + " " +
+            j.get("tags", "")
+        ).lower()
 
         if any(kw in hay for kw in CONFIG["block_keywords"]):
             continue
@@ -316,22 +315,25 @@ def filter_jobs(jobs: List[Dict]) -> List[Dict]:
 
 
 # ─────────────────────────────────────────────
-# GEMINI SCORING  (100% FREE)
+# GROQ SCORING  (100% FREE — 14,400 req/day)
 # ─────────────────────────────────────────────
 
-def score_jobs_with_gemini(jobs):
-    from groq import Groq
+def score_jobs_with_gemini(jobs: List[Dict]) -> Dict:
+    """Scores jobs using Groq's free Llama 3.3-70b API."""
+    if not CONFIG["groq_api_key"]:
+        raise ValueError(
+            "GROQ_API_KEY is not set.\n"
+            "Get a free key at https://console.groq.com → API Keys\n"
+            "Then add it as a GitHub secret named GROQ_API_KEY."
+        )
 
-    if not CONFIG["GROQ_API_KEY"]:
-        raise ValueError("GROQ_API_KEY is not set.")
-
-    client = Groq(api_key=CONFIG["GROQ_API_KEY"])  # reusing same config key
+    client = Groq(api_key=CONFIG["groq_api_key"])
 
     today   = datetime.date.today().isoformat()
     payload = json.dumps(jobs, indent=2, ensure_ascii=False)
     prompt  = f"Today is {today}.\n\nHere are today's scraped job listings:\n\n{payload}"
 
-    log.info(f"Sending {len(jobs)} jobs to Groq (Llama 3.3) for scoring…")
+    log.info(f"Sending {len(jobs)} jobs to Groq (Llama 3.3-70b) for scoring…")
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -344,13 +346,18 @@ def score_jobs_with_gemini(jobs):
     )
 
     raw = response.choices[0].message.content.strip()
+
+    # Strip any accidental markdown fences
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    raw = re.sub(r"\s*```$",          "", raw)
 
     result = json.loads(raw)
-    log.info(f"Groq returned: {result.get('total_evaluated','?')} evaluated, "
-             f"{result.get('high_priority_count','?')} HIGH")
+    log.info(
+        f"Groq returned: {result.get('total_evaluated','?')} evaluated, "
+        f"{result.get('high_priority_count','?')} HIGH"
+    )
     return result
+
 
 # ─────────────────────────────────────────────
 # HTML EMAIL REPORT
@@ -381,10 +388,15 @@ def _job_card(j: Dict) -> str:
     return f"""
     <div style="border:1px solid #e5e7eb;border-radius:8px;margin:10px 0;padding:14px 16px;
                 background:{P_BG.get(p,'#fff')};">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:6px;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;
+                  flex-wrap:wrap;gap:6px;">
         <div>
-          <span style="font-weight:700;font-size:15px;color:#111827">{j.get('rank','')}.&nbsp;{j.get('title','')}</span><br>
-          <span style="color:#6b7280;font-size:13px">{j.get('company','Unknown')} · {j.get('location','')}</span>
+          <span style="font-weight:700;font-size:15px;color:#111827">
+            {j.get('rank','')}.&nbsp;{j.get('title','')}
+          </span><br>
+          <span style="color:#6b7280;font-size:13px">
+            {j.get('company','Unknown')} · {j.get('location','')}
+          </span>
         </div>
         <div style="display:flex;gap:8px;align-items:center;flex-shrink:0;">
           <span style="font-weight:700;font-size:17px;color:{_score_color(sc)}">{sc}/10</span>
@@ -392,7 +404,9 @@ def _job_card(j: Dict) -> str:
                        padding:2px 10px;font-size:12px;font-weight:600">{p}</span>
         </div>
       </div>
-      <p style="margin:8px 0 4px;color:#374151;font-size:13px;line-height:1.5">{j.get('fit_reason','')}</p>
+      <p style="margin:8px 0 4px;color:#374151;font-size:13px;line-height:1.5">
+        {j.get('fit_reason','')}
+      </p>
       <p style="margin:4px 0;font-size:12px;color:#6b7280">
         <b>Exp required:</b> {j.get('experience_required','N/A')} &nbsp;|&nbsp;
         <b>Missing keywords:</b> {kw}
@@ -445,7 +459,7 @@ def build_html_email(result: Dict) -> str:
   <div style="background:linear-gradient(135deg,#1e3a5f,#2563eb);padding:22px 26px;">
     <h1 style="margin:0;color:#fff;font-size:21px">🎯 Daily Job Report</h1>
     <p style="margin:4px 0 0;color:#bfdbfe;font-size:13px">
-      {today} · Jeevan Kumar Reddy · Powered by Gemini Flash (free)
+      {today} · Jeevan Kumar Reddy · Powered by Groq + Llama 3.3 (free)
     </p>
   </div>
 
@@ -469,7 +483,7 @@ def build_html_email(result: Dict) -> str:
 
     <!-- Summary -->
     <div style="background:#f0f9ff;border-left:4px solid #0ea5e9;padding:12px 14px;
-                border-radius:4px;margin-bottom:18px;">
+                border-radius:0 4px 4px 0;margin-bottom:18px;">
       <b style="color:#0369a1;font-size:12px">📊 TODAY'S SUMMARY</b>
       <p style="margin:5px 0 0;color:#374151;font-size:13px;line-height:1.5">{summary}</p>
     </div>
@@ -493,7 +507,7 @@ def build_html_email(result: Dict) -> str:
   <!-- Footer -->
   <div style="background:#f9fafb;padding:14px 26px;border-top:1px solid #e5e7eb;
               text-align:center;font-size:11px;color:#9ca3af;">
-    Auto-generated · Python + Gemini Flash (free tier) · GitHub Actions
+    Auto-generated · Python + Groq Llama 3.3-70b (free) · GitHub Actions
     <br>Sources: Remotive · RemoteOK · Arbeitnow · Naukri RSS
   </div>
 </div>
@@ -510,9 +524,9 @@ def send_email(html_body: str, result: Dict):
         log.warning("EMAIL_PASSWORD not set — skipping email, report saved to disk only.")
         return
 
-    today   = result.get("run_date", datetime.date.today().isoformat())
-    high    = result.get("high_priority_count", 0)
-    emoji   = "🔥" if high >= 3 else ("⭐" if high >= 1 else "📋")
+    today  = result.get("run_date", datetime.date.today().isoformat())
+    high   = result.get("high_priority_count", 0)
+    emoji  = "🔥" if high >= 3 else ("⭐" if high >= 1 else "📋")
     subject = f"{emoji} Job Report {today} — {high} HIGH priority role(s)"
 
     msg = MIMEMultipart("alternative")
@@ -585,9 +599,9 @@ def run():
         log.warning("Nothing passed keyword filter — using first 20 raw as fallback")
         jobs = raw[:20]
 
-    jobs = jobs[:40]   # cap to keep Gemini prompt manageable
+    jobs = jobs[:40]   # cap to keep prompt manageable
 
-    # 3. Score with Gemini (free)
+    # 3. Score with Groq (free)
     result = score_jobs_with_gemini(jobs)
 
     # 4. Build HTML

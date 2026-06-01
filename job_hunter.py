@@ -330,7 +330,7 @@ def score_jobs_with_gemini(jobs: List[Dict]) -> Dict:
     genai.configure(api_key=CONFIG["gemini_api_key"])
 
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",   # free tier: 1M tokens/day, 15 RPM
+        model_name="gemini-2.0-flash",   # free tier: 1M tokens/day, 15 RPM
         system_instruction=SYSTEM_PROMPT,
         generation_config=genai.types.GenerationConfig(
             temperature=0.2,   # low temp = consistent JSON output

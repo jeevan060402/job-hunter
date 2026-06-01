@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  Job Hunter — Daily Automated Pipeline for Jeevan Kumar     ║
-║  AI Engine : Groq (Llama 3.3-70b) — 100% FREE              ║
-║  Schedule  : 9:30 AM IST via GitHub Actions cron            ║
-║  Sources   : Remotive · RemoteOK · Arbeitnow · Naukri RSS   ║
+║  Job Hunter v4 — Daily Automated Pipeline for Jeevan Kumar  ║
+║  AI Engine  : Groq (Llama 3.3-70b) — 100% FREE             ║
+║  Schedule   : 9:30 AM IST via GitHub Actions cron           ║
+║  Sources    : Remotive · RemoteOK · WeWorkRemotely          ║
+║               Jobicy · Arbeitnow · TheMuse                  ║
+║  New in v4  : seen-jobs dedup · retry logic · India source  ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -17,11 +19,12 @@ import requests
 import logging
 import sys
 import re
-import feedparser                          # replaces broken xml.etree for Naukri
-from groq import Groq                      # replaces google.generativeai
+import hashlib
+import feedparser
+from groq import Groq
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import List, Dict
+from typing import List, Dict, Set
 from pathlib import Path
 
 
@@ -29,34 +32,45 @@ from pathlib import Path
 # CONFIGURATION
 # ─────────────────────────────────────────────
 CONFIG = {
-    # Free Groq API key — get from https://console.groq.com (no card needed)
-    "groq_api_key": os.getenv("GROQ_API_KEY", ""),
-
-    # Gmail settings — use an App Password, not your account password
-    # Create one at: https://myaccount.google.com/apppasswords
+    "groq_api_key":    os.getenv("GROQ_API_KEY",    ""),
     "email_sender":    os.getenv("EMAIL_SENDER",    "reddyjeevan936@gmail.com"),
     "email_password":  os.getenv("EMAIL_PASSWORD",  ""),
     "email_recipient": os.getenv("EMAIL_RECIPIENT", "reddyjeevan936@gmail.com"),
     "email_cc":        os.getenv("EMAIL_CC",        ""),
+    "output_dir":      str(Path.home() / "job_reports"),
 
-    # Local archive folder
-    "output_dir": str(Path.home() / "job_reports"),
+    # Path to the seen-jobs cache file (committed back to repo by GitHub Actions)
+    "seen_jobs_path":  "seen_jobs.json",
 
-    # Max listings fetched per source before filtering
-    "max_per_source": 15,
+    # How many days to remember a seen job before showing it again
+    "seen_expiry_days": 14,
 
-    # Keep jobs that contain at least one of these (case-insensitive)
+    "max_per_source": 25,
+
     "filter_keywords": [
-        "python", "django", "fastapi", "backend", "devops", "kubernetes",
-        "k8s", "docker", "platform", "sre", "site reliability",
-        "infrastructure", "cloud", "flask", "microservices",
+        "python", "django", "fastapi", "flask", "backend",
+        "devops", "kubernetes", "k8s", "docker", "platform engineer",
+        "sre", "site reliability", "infrastructure", "cloud engineer",
+        "microservices", "ci/cd", "devsecops",
     ],
 
-    # Drop jobs whose title/description contains any of these
     "block_keywords": [
-        "java only", ".net only", "ruby on rails", "php developer",
-        "android developer", "ios developer", "react developer",
-        "angular developer", "data scientist", "machine learning engineer",
+        " ruby", "rails", " php", "laravel", "wordpress",
+        "golang only", "java only", ".net only", "scala only",
+        "business transformation", "revenue operations",
+        "video editor", "cinemat", "motion graphic",
+        "accountant", "buchhaltung", "comptable",
+        "sales manager", "account executive", "copywriter",
+        "android developer", "ios developer",
+        "react developer", "angular developer", "vue developer",
+        "data scientist", "ml engineer", "ai researcher",
+        "embedded systems", "firmware",
+    ],
+
+    "tech_keywords": [
+        "python", "devops", "kubernetes", "backend", "engineer",
+        "developer", "infrastructure", "platform", "cloud", "sre",
+        "docker", "microservice", "fastapi", "django",
     ],
 }
 
@@ -106,13 +120,19 @@ ROLE C — Remote US/Global (funded startups & product companies)
 -1  Overleveled (requires 8+ years)
 -1  Body-shopping / IT services with no product ownership
 
+=== STRICT MISMATCH RULES ===
+- Ruby / Rails / PHP / Laravel / WordPress → score MAX 3, SKIP always
+- Non-engineering roles (business ops, sales, video, design) → score MAX 2, SKIP always
+- Golang-only or Java-only with zero Python/K8s → score MAX 3, SKIP
+- Roles requiring 8+ years → deduct -1 always
+
 Priority:
-  HIGH   = score 7–10, strong stack match, apply same day
-  MEDIUM = score 4–6, partial match, worth applying with tweaks
-  SKIP   = score 1–3, mismatch or overleveled
+  HIGH   = score 7–10  → apply same day
+  MEDIUM = score 4–6   → apply with minor tweaks
+  SKIP   = score 1–3   → do not apply
 
 === OUTPUT FORMAT ===
-Return ONLY a valid JSON object. No markdown, no code fences, no explanation outside the JSON.
+Return ONLY a valid JSON object — no markdown, no code fences.
 
 {
   "run_date": "YYYY-MM-DD",
@@ -132,19 +152,19 @@ Return ONLY a valid JSON object. No markdown, no code fences, no explanation out
       "apply_priority": "HIGH | MEDIUM | SKIP",
       "fit_reason": "2-3 sentence plain-English explanation",
       "missing_keywords": ["keyword1", "keyword2"],
-      "resume_tweak": "One specific line to add or highlight in resume (HIGH only, else empty string)"
+      "resume_tweak": "One specific line to add/highlight in resume (HIGH only, else empty string)"
     }
   ],
   "top_picks": ["Company A – Role Title", "Company B – Role Title"],
   "action_items": [
     "Apply to [Company] today — strong K8s + FastAPI match",
     "For [Company], add Helm chart deployment to the K8s bullet",
-    "Avoid [Company] — IT services, no product ownership context"
+    "Avoid [Company] — IT services, no product context"
   ],
-  "daily_summary": "2-3 sentence summary of today's batch quality and what to focus on."
+  "daily_summary": "2-3 sentence summary of today's batch and what to focus on."
 }
 
-Sort the jobs array by score descending."""
+Sort jobs array by score descending."""
 
 
 # ─────────────────────────────────────────────
@@ -162,182 +182,437 @@ log = logging.getLogger("job_hunter")
 
 
 # ─────────────────────────────────────────────
+# SEEN-JOBS CACHE  (prevents showing same jobs daily)
+# ─────────────────────────────────────────────
+
+def _job_hash(j: Dict) -> str:
+    """Stable hash from URL, or company+title if URL is empty."""
+    key = j.get("url") or f"{j.get('company','')}|{j.get('title','')}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+
+def load_seen_jobs() -> Dict:
+    """Load seen-jobs cache from disk. Returns {hash: date_str}."""
+    path = Path(CONFIG["seen_jobs_path"])
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_seen_jobs(seen: Dict):
+    """Persist updated cache to disk."""
+    Path(CONFIG["seen_jobs_path"]).write_text(
+        json.dumps(seen, indent=2, ensure_ascii=False)
+    )
+
+
+def expire_seen_jobs(seen: Dict) -> Dict:
+    """Remove entries older than seen_expiry_days."""
+    cutoff = datetime.date.today() - datetime.timedelta(days=CONFIG["seen_expiry_days"])
+    return {
+        h: d for h, d in seen.items()
+        if datetime.date.fromisoformat(d) >= cutoff
+    }
+
+
+def filter_seen(jobs: List[Dict], seen: Dict) -> List[Dict]:
+    """Return only jobs NOT in the seen cache."""
+    new_jobs = [j for j in jobs if _job_hash(j) not in seen]
+    skipped  = len(jobs) - len(new_jobs)
+    if skipped:
+        log.info(f"Seen-jobs filter: removed {skipped} already-seen listings, {len(new_jobs)} new")
+    return new_jobs
+
+
+def mark_as_seen(jobs: List[Dict], seen: Dict) -> Dict:
+    """Add today's jobs to the seen cache."""
+    today = datetime.date.today().isoformat()
+    for j in jobs:
+        seen[_job_hash(j)] = today
+    return seen
+
+
+# ─────────────────────────────────────────────
+# RETRY HELPER
+# ─────────────────────────────────────────────
+
+def _get(url: str, headers: Dict = None, params: Dict = None,
+         timeout: int = 15, retries: int = 2) -> requests.Response:
+    """requests.get with automatic retry on 429 / 5xx."""
+    h = headers or {"User-Agent": "JobHunterBot/1.0"}
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, headers=h, params=params, timeout=timeout)
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 10))
+                log.warning(f"Rate limited by {url} — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r
+        except requests.exceptions.Timeout:
+            log.warning(f"Timeout on {url} (attempt {attempt+1})")
+            if attempt < retries:
+                time.sleep(3)
+        except requests.exceptions.RequestException as e:
+            log.warning(f"Request error {url}: {e}")
+            if attempt < retries:
+                time.sleep(3)
+    return None
+
+
+# ─────────────────────────────────────────────
 # JOB FETCHERS
 # ─────────────────────────────────────────────
 
 def fetch_remotive() -> List[Dict]:
-    """Remotive.com — free API, best for remote startup + product company roles."""
-    jobs = []
-    categories = ["software-dev", "devops-sysadmin", "backend"]
-    headers = {"User-Agent": "JobHunterBot/1.0 (personal; reddyjeevan936@gmail.com)"}
-    for cat in categories:
-        try:
-            r = requests.get(
-                f"https://remotive.com/api/remote-jobs?category={cat}&limit={CONFIG['max_per_source']}",
-                headers=headers, timeout=15,
-            )
-            r.raise_for_status()
+    """Remotive — category search + keyword search for full coverage."""
+    jobs, seen_urls = [], set()
+    h = {"User-Agent": "JobHunterBot/1.0 (personal; reddyjeevan936@gmail.com)"}
+
+    for cat in ["software-dev", "devops-sysadmin", "backend"]:
+        r = _get(f"https://remotive.com/api/remote-jobs?category={cat}&limit={CONFIG['max_per_source']}", headers=h)
+        if r:
             for j in r.json().get("jobs", []):
-                jobs.append({
-                    "source":      "Remotive",
-                    "title":       j.get("title", ""),
-                    "company":     j.get("company_name", ""),
-                    "location":    j.get("candidate_required_location", "Remote"),
-                    "url":         j.get("url", ""),
-                    "description": _clean(j.get("description", ""), 800),
-                    "tags":        ", ".join(j.get("tags", [])),
-                    "salary":      j.get("salary", ""),
-                    "posted":      j.get("publication_date", ""),
-                })
-            log.info(f"Remotive [{cat}]: {len(jobs)} total so far")
-            time.sleep(1)
-        except Exception as e:
-            log.warning(f"Remotive [{cat}]: {e}")
+                if j.get("url") not in seen_urls:
+                    seen_urls.add(j.get("url"))
+                    jobs.append(_remotive_item(j))
+        time.sleep(1)
+
+    for kw in ["python", "devops", "kubernetes"]:
+        r = _get(f"https://remotive.com/api/remote-jobs?search={kw}&limit=10", headers=h)
+        if r:
+            for j in r.json().get("jobs", []):
+                if j.get("url") not in seen_urls:
+                    seen_urls.add(j.get("url"))
+                    jobs.append(_remotive_item(j))
+        time.sleep(1)
+
+    log.info(f"Remotive: {len(jobs)} listings")
     return jobs
 
 
+def _remotive_item(j: Dict) -> Dict:
+    return {
+        "source":      "Remotive",
+        "title":       j.get("title", ""),
+        "company":     j.get("company_name", ""),
+        "location":    j.get("candidate_required_location", "Remote"),
+        "url":         j.get("url", ""),
+        "description": _clean(j.get("description", ""), 800),
+        "tags":        ", ".join(j.get("tags", [])),
+        "salary":      j.get("salary", ""),
+        "posted":      j.get("publication_date", ""),
+    }
+
+
 def fetch_remoteok() -> List[Dict]:
-    """RemoteOK — free JSON feed, lots of US startup remote roles with salary."""
-    jobs = []
-    try:
-        r = requests.get(
-            "https://remoteok.com/api",
+    """RemoteOK — tag-filtered for Python/DevOps/K8s roles."""
+    jobs, seen_urls = [], set()
+    for tag in ["python", "devops", "kubernetes", "backend"]:
+        r = _get(
+            f"https://remoteok.com/api?tags={tag}",
             headers={"User-Agent": "Mozilla/5.0 (compatible; JobHunterBot/1.0)"},
             timeout=20,
         )
-        r.raise_for_status()
-        listings = [j for j in r.json() if isinstance(j, dict) and j.get("position")]
-        for j in listings[:CONFIG["max_per_source"]]:
-            tags = j.get("tags", [])
-            jobs.append({
-                "source":      "RemoteOK",
-                "title":       j.get("position", ""),
-                "company":     j.get("company", ""),
-                "location":    "Remote",
-                "url":         j.get("url", ""),
-                "description": _clean(j.get("description", ""), 800),
-                "tags":        ", ".join(tags) if isinstance(tags, list) else "",
-                "salary":      f"{j.get('salary_min','')}-{j.get('salary_max','')}".strip("-"),
-                "posted":      j.get("date", ""),
-            })
-        log.info(f"RemoteOK: {len(jobs)} listings")
-    except Exception as e:
-        log.warning(f"RemoteOK: {e}")
+        if r:
+            listings = [j for j in r.json() if isinstance(j, dict) and j.get("position")]
+            for j in listings[:12]:
+                url = j.get("url", "")
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                tags   = j.get("tags", [])
+                s_min  = j.get("salary_min", "")
+                s_max  = j.get("salary_max", "")
+                salary = f"${s_min}–${s_max}" if s_min and s_max else ""
+                jobs.append({
+                    "source":      "RemoteOK",
+                    "title":       j.get("position", ""),
+                    "company":     j.get("company", ""),
+                    "location":    "Remote",
+                    "url":         url,
+                    "description": _clean(j.get("description", ""), 800),
+                    "tags":        ", ".join(tags) if isinstance(tags, list) else "",
+                    "salary":      salary,
+                    "posted":      j.get("date", ""),
+                })
+        time.sleep(2)
+
+    log.info(f"RemoteOK: {len(jobs)} listings")
+    return jobs
+
+
+def fetch_weworkremotely() -> List[Dict]:
+    """We Work Remotely — highest quality remote US startup jobs via RSS."""
+    jobs = []
+    feeds = [
+        ("https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss",  "Backend"),
+        ("https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",       "DevOps"),
+        ("https://weworkremotely.com/categories/remote-full-stack-programming-jobs.rss","Full-Stack"),
+    ]
+    for url, label in feeds:
+        r = _get(url, timeout=10)
+        if r:
+            feed = feedparser.parse(r.content)
+            for entry in feed.entries[:12]:
+                title = entry.get("title", "")
+                company, job_title = (title.split(": ", 1) if ": " in title else ("", title))
+                jobs.append({
+                    "source":      "WeWorkRemotely",
+                    "title":       job_title.strip(),
+                    "company":     company.strip(),
+                    "location":    "Remote (Worldwide)",
+                    "url":         entry.get("link", ""),
+                    "description": _clean(entry.get("summary", ""), 800),
+                    "tags":        label,
+                    "salary":      "",
+                    "posted":      entry.get("published", ""),
+                })
+            log.info(f"WeWorkRemotely [{label}]: {len(feed.entries)} entries")
+        time.sleep(1)
+
+    log.info(f"WeWorkRemotely total: {len(jobs)}")
+    return jobs
+
+
+def fetch_jobicy() -> List[Dict]:
+    """Jobicy — free API, good salary data, Python/DevOps/Backend tags."""
+    jobs, seen_urls = [], set()
+    for tag, label in [("python-developer","Python"), ("devops-engineer","DevOps"),
+                        ("backend-developer","Backend")]:
+        r = _get(
+            "https://jobicy.com/api/v2/remote-jobs",
+            params={"count": 15, "tag": tag},
+        )
+        if r:
+            for j in r.json().get("jobs", []):
+                url = j.get("url", "")
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                s_min  = j.get("annualSalaryMin", "")
+                s_max  = j.get("annualSalaryMax", "")
+                cur    = j.get("salaryCurrency", "USD")
+                salary = f"{cur} {s_min}–{s_max}" if s_min and s_max else ""
+                jobs.append({
+                    "source":      "Jobicy",
+                    "title":       j.get("jobTitle", ""),
+                    "company":     j.get("companyName", ""),
+                    "location":    j.get("jobGeo", "Remote"),
+                    "url":         url,
+                    "description": _clean(j.get("jobDescription", ""), 800),
+                    "tags":        label,
+                    "salary":      salary,
+                    "posted":      j.get("pubDate", ""),
+                })
+        time.sleep(1)
+
+    log.info(f"Jobicy: {len(jobs)} listings")
     return jobs
 
 
 def fetch_arbeitnow() -> List[Dict]:
-    """Arbeitnow — free API, global remote jobs, many EU + US startups."""
+    """Arbeitnow — remote filter + non-English skip."""
     jobs = []
-    try:
-        r = requests.get(
-            "https://www.arbeitnow.com/api/job-board-api",
-            headers={"User-Agent": "JobHunterBot/1.0"},
-            params={"tags": "python,devops,kubernetes,django,fastapi"},
-            timeout=15,
-        )
-        r.raise_for_status()
+    non_en = ["gmbh","co. kg","s.r.o","s.a.","b.v.","s.p.a",
+              "kaufmännisch","mitarbeiter","buchhaltung",
+              "développeur","comptable","ingénieur","développement"]
+    r = _get(
+        "https://www.arbeitnow.com/api/job-board-api",
+        params={"tags": "python,devops,kubernetes,django,fastapi", "remote": "true"},
+    )
+    if r:
         for j in r.json().get("data", [])[:CONFIG["max_per_source"]]:
+            hay = (j.get("title","") + " " + j.get("company_name","") + " " +
+                   j.get("description","")).lower()
+            if any(w in hay for w in non_en):
+                continue
             jobs.append({
                 "source":      "Arbeitnow",
                 "title":       j.get("title", ""),
                 "company":     j.get("company_name", ""),
-                "location":    j.get("location", "") + (" [Remote]" if j.get("remote") else ""),
+                "location":    j.get("location","") + (" [Remote]" if j.get("remote") else ""),
                 "url":         j.get("url", ""),
                 "description": _clean(j.get("description", ""), 800),
                 "tags":        ", ".join(j.get("tags", [])),
                 "salary":      "",
                 "posted":      j.get("created_at", ""),
             })
-        log.info(f"Arbeitnow: {len(jobs)} listings")
-    except Exception as e:
-        log.warning(f"Arbeitnow: {e}")
+
+    log.info(f"Arbeitnow: {len(jobs)} listings")
     return jobs
 
 
-def fetch_naukri_rss() -> List[Dict]:
-    """Naukri RSS — requests fetches with timeout, feedparser parses content."""
+def fetch_themuse() -> List[Dict]:
+    """The Muse — free API, no auth, engineering-only post-filter."""
     jobs = []
-    feeds = [
-        "https://www.naukri.com/rss/jobs/python-developer-jobs-in-hyderabad.rss",
-        "https://www.naukri.com/rss/jobs/devops-engineer-jobs-in-hyderabad.rss",
-        "https://www.naukri.com/rss/jobs/python-developer-jobs-in-india.rss",
-        "https://www.naukri.com/rss/jobs/kubernetes-engineer-jobs-in-india.rss",
+    searches = [
+        ("Software Engineer",  "Mid Level"),
+        ("Software Engineer",  "Senior Level"),
+        ("DevOps & SysAdmin",  "Mid Level"),
+        ("DevOps & SysAdmin",  "Senior Level"),
     ]
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; JobHunterBot/1.0)"}
-    for url in feeds:
-        try:
-            r = requests.get(url, headers=headers, timeout=8)  # hard 8s timeout
-            r.raise_for_status()
-            feed = feedparser.parse(r.content)                  # parse already-fetched bytes
-            for entry in feed.entries[:8]:
+    for cat, level in searches:
+        r = _get(
+            "https://www.themuse.com/api/public/jobs",
+            params={"category": cat, "level": level, "page": 1, "descending": "true"},
+        )
+        if r:
+            for j in r.json().get("results", [])[:8]:
+                check = (j.get("name","") + " " + j.get("contents","")).lower()
+                if not any(k in check for k in CONFIG["tech_keywords"]):
+                    continue
+                locs = j.get("locations", [])
+                loc  = ", ".join(l.get("name","") for l in locs) or "Remote"
                 jobs.append({
-                    "source":      "Naukri",
-                    "title":       entry.get("title", ""),
-                    "company":     entry.get("author", ""),
-                    "location":    "India",
-                    "url":         entry.get("link", ""),
-                    "description": _clean(entry.get("summary", ""), 600),
-                    "tags":        "",
+                    "source":      "TheMuse",
+                    "title":       j.get("name", ""),
+                    "company":     j.get("company", {}).get("name", ""),
+                    "location":    loc,
+                    "url":         j.get("refs", {}).get("landing_page", ""),
+                    "description": _clean(j.get("contents", ""), 800),
+                    "tags":        cat,
                     "salary":      "",
-                    "posted":      entry.get("published", ""),
+                    "posted":      j.get("publication_date", ""),
                 })
-            log.info(f"Naukri [{url.split('/')[-1]}]: {len(feed.entries)} entries")
-            time.sleep(1)
-        except requests.exceptions.Timeout:
-            log.warning(f"Naukri RSS timeout (skipping): {url}")
-        except Exception as e:
-            log.warning(f"Naukri RSS {url}: {e}")
-    log.info(f"Naukri total: {len(jobs)} jobs")
+        time.sleep(1)
+
+    log.info(f"TheMuse: {len(jobs)} listings")
     return jobs
+
+
+def fetch_hn_jobs() -> List[Dict]:
+    """
+    HackerNews 'Who is Hiring' monthly thread — best source for
+    YC-backed & funded startup jobs. Parsed via Algolia + HN Firebase API.
+    Only runs if today is in the first 7 days of the month (when the thread is fresh).
+    """
+    jobs = []
+    today = datetime.date.today()
+    if today.day > 7:
+        log.info("HackerNews Who's Hiring: skipping (only runs on days 1–7 of month)")
+        return jobs
+
+    try:
+        # Find the latest "Ask HN: Who is hiring?" post
+        r = _get(
+            "https://hn.algolia.com/api/v1/search_by_date",
+            params={"query": "Ask HN: Who is hiring?", "tags": "ask_hn", "hitsPerPage": 1},
+        )
+        if not r:
+            return jobs
+
+        hits = r.json().get("hits", [])
+        if not hits:
+            return jobs
+
+        post_id = hits[0].get("objectID")
+        month   = hits[0].get("title", "")
+        log.info(f"HackerNews: parsing '{month}' (id={post_id})")
+
+        # Fetch top-level comment IDs
+        r2 = _get(f"https://hacker-news.firebaseio.com/v0/item/{post_id}.json")
+        if not r2:
+            return jobs
+
+        kids = r2.json().get("kids", [])[:150]   # top 150 comments
+
+        # Fetch each comment and filter for Python/DevOps mentions
+        kw = ["python", "django", "fastapi", "devops", "kubernetes",
+              "k8s", "backend", "remote", "docker", "flask"]
+        count = 0
+        for kid_id in kids:
+            if count >= 20:    # cap at 20 HN items
+                break
+            r3 = _get(f"https://hacker-news.firebaseio.com/v0/item/{kid_id}.json", timeout=8)
+            if not r3:
+                continue
+            item = r3.json()
+            if item.get("dead") or item.get("deleted"):
+                continue
+
+            text = _clean(item.get("text", ""), 1000)
+            if not any(k in text.lower() for k in kw):
+                continue
+
+            # Extract company name from first line (most HN posts start with "Company | Role | ...")
+            first_line = text.split("\n")[0][:120] if text else ""
+            jobs.append({
+                "source":      "HackerNews",
+                "title":       first_line or "Software Engineer (HN Hiring)",
+                "company":     first_line.split("|")[0].strip() if "|" in first_line else "Unknown",
+                "location":    "Remote" if "remote" in text.lower() else "See listing",
+                "url":         f"https://news.ycombinator.com/item?id={kid_id}",
+                "description": text,
+                "tags":        "HN Who is Hiring",
+                "salary":      "",
+                "posted":      today.isoformat(),
+            })
+            count += 1
+            time.sleep(0.2)
+
+        log.info(f"HackerNews: {len(jobs)} relevant listings")
+
+    except Exception as e:
+        log.warning(f"HackerNews fetch error: {e}")
+
+    return jobs
+
 
 # ─────────────────────────────────────────────
-# FILTERING
+# FILTERING & DEDUPLICATION
 # ─────────────────────────────────────────────
 
 def filter_jobs(jobs: List[Dict]) -> List[Dict]:
-    filtered, seen = [], set()
+    filtered    = []
+    seen_urls   = set()
+    seen_titles = set()
+
     for j in jobs:
         url = j.get("url", "")
-        if url in seen:
-            continue
-        seen.add(url)
 
-        hay = (
-            j.get("title", "") + " " +
-            j.get("description", "") + " " +
-            j.get("tags", "")
-        ).lower()
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        title_key = f"{j.get('company','').lower().strip()}|{j.get('title','').lower().strip()[:60]}"
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+
+        hay = (j.get("title","") + " " + j.get("description","") + " " + j.get("tags","")).lower()
 
         if any(kw in hay for kw in CONFIG["block_keywords"]):
             continue
-        if any(kw in hay for kw in CONFIG["filter_keywords"]):
-            filtered.append(j)
+        if not any(kw in hay for kw in CONFIG["filter_keywords"]):
+            continue
 
-    log.info(f"After filtering: {len(filtered)} / {len(jobs)} jobs kept")
+        filtered.append(j)
+
+    log.info(f"After keyword filter: {len(filtered)} / {len(jobs)} kept")
     return filtered
 
 
 # ─────────────────────────────────────────────
-# GROQ SCORING  (100% FREE — 14,400 req/day)
+# GROQ SCORING
 # ─────────────────────────────────────────────
 
-def score_jobs_with_gemini(jobs: List[Dict]) -> Dict:
-    """Scores jobs using Groq's free Llama 3.3-70b API."""
+def score_jobs_with_groq(jobs: List[Dict]) -> Dict:
     if not CONFIG["groq_api_key"]:
         raise ValueError(
-            "GROQ_API_KEY is not set.\n"
-            "Get a free key at https://console.groq.com → API Keys\n"
-            "Then add it as a GitHub secret named GROQ_API_KEY."
+            "GROQ_API_KEY not set. Get a free key at https://console.groq.com"
         )
 
-    client = Groq(api_key=CONFIG["groq_api_key"])
-
+    client  = Groq(api_key=CONFIG["groq_api_key"])
     today   = datetime.date.today().isoformat()
     payload = json.dumps(jobs, indent=2, ensure_ascii=False)
-    prompt  = f"Today is {today}.\n\nHere are today's scraped job listings:\n\n{payload}"
+    prompt  = f"Today is {today}.\n\nHere are today's NEW job listings:\n\n{payload}"
 
-    log.info(f"Sending {len(jobs)} jobs to Groq (Llama 3.3-70b) for scoring…")
+    log.info(f"Sending {len(jobs)} jobs to Groq (Llama 3.3-70b)…")
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -350,15 +625,14 @@ def score_jobs_with_gemini(jobs: List[Dict]) -> Dict:
     )
 
     raw = response.choices[0].message.content.strip()
-
-    # Strip any accidental markdown fences
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$",          "", raw)
 
     result = json.loads(raw)
     log.info(
-        f"Groq returned: {result.get('total_evaluated','?')} evaluated, "
-        f"{result.get('high_priority_count','?')} HIGH"
+        f"Groq done: {result.get('total_evaluated','?')} evaluated | "
+        f"{result.get('high_priority_count','?')} HIGH | "
+        f"{result.get('medium_priority_count','?')} MEDIUM"
     )
     return result
 
@@ -369,6 +643,15 @@ def score_jobs_with_gemini(jobs: List[Dict]) -> Dict:
 
 P_COLOR = {"HIGH": "#16a34a", "MEDIUM": "#d97706", "SKIP": "#9ca3af"}
 P_BG    = {"HIGH": "#f0fdf4", "MEDIUM": "#fffbeb", "SKIP": "#f9fafb"}
+SRC_BADGE = {
+    "Remotive":       "#dbeafe",
+    "RemoteOK":       "#fce7f3",
+    "WeWorkRemotely": "#d1fae5",
+    "Jobicy":         "#fef3c7",
+    "Arbeitnow":      "#e0e7ff",
+    "TheMuse":        "#ffe4e6",
+    "HackerNews":     "#fff3cd",
+}
 
 
 def _score_color(s: int) -> str:
@@ -383,11 +666,19 @@ def _job_card(j: Dict) -> str:
     kw  = ", ".join(j.get("missing_keywords", [])) or "None"
     tw  = j.get("resume_tweak", "")
     src = j.get("source", "")
+    sal = j.get("salary", "")
+    src_color = SRC_BADGE.get(src, "#f3f4f6")
+
     tweak_html = (
         f"<p style='margin:6px 0 0;font-size:12px;background:#eff6ff;"
-        f"border-left:3px solid #3b82f6;padding:6px 10px;border-radius:4px'>"
+        f"border-left:3px solid #3b82f6;padding:6px 10px;border-radius:0 4px 4px 0'>"
         f"<b>📝 Resume tweak:</b> {tw}</p>"
     ) if tw and p == "HIGH" else ""
+
+    salary_html = (
+        f"<span style='font-size:11px;background:#f0fdf4;color:#166534;"
+        f"padding:1px 7px;border-radius:4px;margin-left:6px'>{sal}</span>"
+    ) if sal else ""
 
     return f"""
     <div style="border:1px solid #e5e7eb;border-radius:8px;margin:10px 0;padding:14px 16px;
@@ -397,7 +688,7 @@ def _job_card(j: Dict) -> str:
         <div>
           <span style="font-weight:700;font-size:15px;color:#111827">
             {j.get('rank','')}.&nbsp;{j.get('title','')}
-          </span><br>
+          </span>{salary_html}<br>
           <span style="color:#6b7280;font-size:13px">
             {j.get('company','Unknown')} · {j.get('location','')}
           </span>
@@ -412,20 +703,21 @@ def _job_card(j: Dict) -> str:
         {j.get('fit_reason','')}
       </p>
       <p style="margin:4px 0;font-size:12px;color:#6b7280">
-        <b>Exp required:</b> {j.get('experience_required','N/A')} &nbsp;|&nbsp;
-        <b>Missing keywords:</b> {kw}
+        <b>Exp:</b> {j.get('experience_required','N/A')} &nbsp;|&nbsp;
+        <b>Missing:</b> {kw}
       </p>
       {tweak_html}
-      <div style="margin-top:10px;display:flex;align-items:center;gap:12px;">
+      <div style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
         <a href="{j.get('apply_url','#')}"
            style="background:#2563eb;color:#fff;padding:6px 16px;border-radius:4px;
                   text-decoration:none;font-size:13px;font-weight:600">Apply →</a>
-        <span style="font-size:11px;color:#9ca3af">via {src}</span>
+        <span style="font-size:11px;background:{src_color};color:#374151;
+                     padding:2px 8px;border-radius:4px">via {src}</span>
       </div>
     </div>"""
 
 
-def build_html_email(result: Dict) -> str:
+def build_html_email(result: Dict, new_count: int, total_raw: int) -> str:
     today   = result.get("run_date", datetime.date.today().isoformat())
     high    = result.get("high_priority_count", 0)
     medium  = result.get("medium_priority_count", 0)
@@ -434,16 +726,15 @@ def build_html_email(result: Dict) -> str:
     actions = result.get("action_items", [])
     jobs    = result.get("jobs", [])
 
-    apply_jobs = [j for j in jobs if j.get("apply_priority") != "SKIP"]
-    skip_jobs  = [j for j in jobs if j.get("apply_priority") == "SKIP"]
-
+    apply_jobs   = [j for j in jobs if j.get("apply_priority") != "SKIP"]
+    skip_jobs    = [j for j in jobs if j.get("apply_priority") == "SKIP"]
     cards_html   = "".join(_job_card(j) for j in apply_jobs)
     picks_html   = "".join(f"<li>⭐ {p}</li>" for p in picks)
     actions_html = "".join(f"<li>→ {a}</li>" for a in actions)
     skip_html    = "".join(
         f"<li style='color:#9ca3af;font-size:12px'>"
-        f"{j.get('rank','')}.&nbsp;{j.get('title','')} — {j.get('company','')} "
-        f"(Score: {j.get('score',0)})</li>"
+        f"{j.get('rank','')}.&nbsp;{j.get('title','')} — "
+        f"{j.get('company','')} (Score: {j.get('score',0)})</li>"
         for j in skip_jobs
     )
 
@@ -459,60 +750,53 @@ def build_html_email(result: Dict) -> str:
 <div style="max-width:680px;margin:24px auto;background:#fff;border-radius:12px;
             box-shadow:0 1px 4px rgba(0,0,0,.1);overflow:hidden;">
 
-  <!-- Header -->
   <div style="background:linear-gradient(135deg,#1e3a5f,#2563eb);padding:22px 26px;">
     <h1 style="margin:0;color:#fff;font-size:21px">🎯 Daily Job Report</h1>
     <p style="margin:4px 0 0;color:#bfdbfe;font-size:13px">
-      {today} · Jeevan Kumar Reddy · Powered by Groq + Llama 3.3 (free)
+      {today} · Jeevan Kumar Reddy · Groq + Llama 3.3 (free) · v4
     </p>
   </div>
 
-  <!-- Stats -->
   <div style="display:flex;border-bottom:1px solid #e5e7eb;">
-    <div style="flex:1;text-align:center;padding:14px;border-right:1px solid #e5e7eb;">
-      <div style="font-size:26px;font-weight:700;color:#111827">{result.get('total_evaluated',0)}</div>
-      <div style="font-size:12px;color:#6b7280;margin-top:2px">Evaluated</div>
+    <div style="flex:1;text-align:center;padding:12px 8px;border-right:1px solid #e5e7eb;">
+      <div style="font-size:22px;font-weight:700;color:#111827">{total_raw}</div>
+      <div style="font-size:11px;color:#6b7280;margin-top:2px">Scraped</div>
     </div>
-    <div style="flex:1;text-align:center;padding:14px;border-right:1px solid #e5e7eb;">
-      <div style="font-size:26px;font-weight:700;color:#16a34a">{high}</div>
-      <div style="font-size:12px;color:#6b7280;margin-top:2px">HIGH Priority</div>
+    <div style="flex:1;text-align:center;padding:12px 8px;border-right:1px solid #e5e7eb;">
+      <div style="font-size:22px;font-weight:700;color:#2563eb">{new_count}</div>
+      <div style="font-size:11px;color:#6b7280;margin-top:2px">New today</div>
     </div>
-    <div style="flex:1;text-align:center;padding:14px;">
-      <div style="font-size:26px;font-weight:700;color:#d97706">{medium}</div>
-      <div style="font-size:12px;color:#6b7280;margin-top:2px">MEDIUM Priority</div>
+    <div style="flex:1;text-align:center;padding:12px 8px;border-right:1px solid #e5e7eb;">
+      <div style="font-size:22px;font-weight:700;color:#16a34a">{high}</div>
+      <div style="font-size:11px;color:#6b7280;margin-top:2px">HIGH</div>
+    </div>
+    <div style="flex:1;text-align:center;padding:12px 8px;">
+      <div style="font-size:22px;font-weight:700;color:#d97706">{medium}</div>
+      <div style="font-size:11px;color:#6b7280;margin-top:2px">MEDIUM</div>
     </div>
   </div>
 
   <div style="padding:22px 26px;">
-
-    <!-- Summary -->
     <div style="background:#f0f9ff;border-left:4px solid #0ea5e9;padding:12px 14px;
                 border-radius:0 4px 4px 0;margin-bottom:18px;">
       <b style="color:#0369a1;font-size:12px">📊 TODAY'S SUMMARY</b>
       <p style="margin:5px 0 0;color:#374151;font-size:13px;line-height:1.5">{summary}</p>
     </div>
 
-    <!-- Top picks -->
     {"<div style='background:#f0fdf4;border-radius:8px;padding:12px 14px;margin-bottom:18px;'><b style='color:#16a34a;font-size:12px'>⭐ TOP PICKS TODAY</b><ul style='margin:6px 0 0;padding-left:16px;font-size:13px;color:#374151'>" + picks_html + "</ul></div>" if picks else ""}
-
-    <!-- Action items -->
     {"<div style='background:#fefce8;border-radius:8px;padding:12px 14px;margin-bottom:18px;'><b style='color:#a16207;font-size:12px'>✅ ACTION ITEMS</b><ul style='margin:6px 0 0;padding-left:16px;font-size:13px;color:#374151'>" + actions_html + "</ul></div>" if actions else ""}
 
-    <!-- Job cards -->
     <h2 style="font-size:15px;color:#111827;margin:0 0 4px">Apply Today & This Week</h2>
-    <p style="font-size:12px;color:#6b7280;margin:0 0 14px">Sorted by fit score ↓</p>
-    {cards_html or "<p style='color:#9ca3af;font-size:14px'>No strong matches today — check back tomorrow.</p>"}
+    <p style="font-size:12px;color:#6b7280;margin:0 0 14px">Sorted by fit score — new listings only</p>
+    {cards_html or "<p style='color:#9ca3af;font-size:14px'>No new matches today — all recent listings already seen. Check back tomorrow.</p>"}
 
-    <!-- Skipped -->
     {"<details style='margin-top:18px'><summary style='cursor:pointer;color:#6b7280;font-size:13px'>Show " + str(len(skip_jobs)) + " skipped / mismatched roles</summary><ul style='margin:6px 0 0;padding-left:16px'>" + skip_html + "</ul></details>" if skip_jobs else ""}
-
   </div>
 
-  <!-- Footer -->
   <div style="background:#f9fafb;padding:14px 26px;border-top:1px solid #e5e7eb;
               text-align:center;font-size:11px;color:#9ca3af;">
-    Auto-generated · Python + Groq Llama 3.3-70b (free) · GitHub Actions
-    <br>Sources: Remotive · RemoteOK · Arbeitnow · Naukri RSS
+    Auto-generated · Groq Llama 3.3-70b (free) · GitHub Actions · v4
+    <br>Sources: Remotive · RemoteOK · WeWorkRemotely · Jobicy · Arbeitnow · TheMuse · HackerNews
   </div>
 </div>
 </body>
@@ -525,12 +809,12 @@ def build_html_email(result: Dict) -> str:
 
 def send_email(html_body: str, result: Dict):
     if not CONFIG["email_password"]:
-        log.warning("EMAIL_PASSWORD not set — skipping email, report saved to disk only.")
+        log.warning("EMAIL_PASSWORD not set — skipping email.")
         return
 
-    today  = result.get("run_date", datetime.date.today().isoformat())
-    high   = result.get("high_priority_count", 0)
-    emoji  = "🔥" if high >= 3 else ("⭐" if high >= 1 else "📋")
+    today   = result.get("run_date", datetime.date.today().isoformat())
+    high    = result.get("high_priority_count", 0)
+    emoji   = "🔥" if high >= 3 else ("⭐" if high >= 1 else "📋")
     subject = f"{emoji} Job Report {today} — {high} HIGH priority role(s)"
 
     msg = MIMEMultipart("alternative")
@@ -582,59 +866,91 @@ def _clean(text: str, limit: int) -> str:
 
 def run():
     log.info("═" * 55)
-    log.info("🚀 Job Hunter started")
+    log.info("🚀 Job Hunter v4 started")
     log.info("═" * 55)
 
-    # 1. Fetch from all sources
+    # 1. Load seen-jobs cache
+    seen = load_seen_jobs()
+    seen = expire_seen_jobs(seen)
+    log.info(f"Seen-jobs cache: {len(seen)} entries (last {CONFIG['seen_expiry_days']} days)")
+
+    # 2. Fetch from all 7 sources
     raw: List[Dict] = []
     raw.extend(fetch_remotive())
     raw.extend(fetch_remoteok())
+    raw.extend(fetch_weworkremotely())
+    raw.extend(fetch_jobicy())
     raw.extend(fetch_arbeitnow())
-    raw.extend(fetch_naukri_rss())
-    log.info(f"Raw listings: {len(raw)}")
+    raw.extend(fetch_themuse())
+    raw.extend(fetch_hn_jobs())
+    total_raw = len(raw)
+    log.info(f"Total raw listings: {total_raw}")
 
     if not raw:
         log.error("No jobs fetched — check network or API sources")
         sys.exit(1)
 
-    # 2. Filter + deduplicate
+    # 3. Keyword filter + company-title dedup
     jobs = filter_jobs(raw)
+
+    # 4. Remove already-seen jobs — only score NEW ones
+    jobs = filter_seen(jobs, seen)
+    new_count = len(jobs)
+
     if not jobs:
-        log.warning("Nothing passed keyword filter — using first 20 raw as fallback")
-        jobs = raw[:20]
+        log.info("No new jobs today — all listings already seen. Sending 'no new jobs' email.")
+        result = {
+            "run_date": datetime.date.today().isoformat(),
+            "total_evaluated": 0, "high_priority_count": 0, "medium_priority_count": 0,
+            "jobs": [], "top_picks": [], "action_items": [],
+            "daily_summary": "No new job listings today — all sources returned listings already seen in the past 14 days. Try again tomorrow.",
+        }
+        html = build_html_email(result, 0, total_raw)
+        save_report(result, html)
+        try:
+            send_email(html, result)
+        except Exception as e:
+            log.error(f"Email failed: {e}")
+        return
 
-    jobs = jobs[:40]   # cap to keep prompt manageable
+    # Cap at 40 for Groq
+    jobs = jobs[:40]
+    log.info(f"Sending {len(jobs)} new jobs to Groq")
 
-    # 3. Score with Groq (free)
-    result = score_jobs_with_gemini(jobs)
+    # 5. Score with Groq
+    result = score_jobs_with_groq(jobs)
 
-    # 4. Build HTML
-    html = build_html_email(result)
+    # 6. Mark ALL fetched jobs as seen (not just the ones sent to Groq)
+    all_filtered = filter_jobs(raw)
+    seen = mark_as_seen(all_filtered, seen)
+    save_seen_jobs(seen)
+    log.info(f"Seen-jobs cache updated: {len(seen)} total entries")
 
-    # 5. Save to disk
+    # 7. Build + save report
+    html      = build_html_email(result, new_count, total_raw)
     html_path = save_report(result, html)
 
-    # 6. Email
+    # 8. Email
     try:
         send_email(html, result)
     except Exception as e:
         log.error(f"Email failed: {e}")
 
-    # 7. Console summary
+    # 9. Console summary
     print("\n" + "═" * 55)
     print(f"  DATE         : {result.get('run_date')}")
+    print(f"  RAW SCRAPED  : {total_raw}")
+    print(f"  NEW TODAY    : {new_count}")
     print(f"  EVALUATED    : {result.get('total_evaluated', 0)}")
     print(f"  HIGH         : {result.get('high_priority_count', 0)}")
     print(f"  MEDIUM       : {result.get('medium_priority_count', 0)}")
     print(f"  REPORT       : {html_path}")
     print("═" * 55)
-
     for p in result.get("top_picks", []):
         print(f"  ⭐ {p}")
     for a in result.get("action_items", []):
         print(f"  • {a}")
     print()
-
     log.info("✅ Done")
 
 

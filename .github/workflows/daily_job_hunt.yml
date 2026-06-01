@@ -2,11 +2,13 @@ name: Daily Job Hunt — 9:30 AM IST
 
 on:
   schedule:
-    # 04:00 UTC = 09:30 IST  (UTC+5:30)
+    # 04:00 UTC = 09:30 IST
     - cron: "0 4 * * *"
-
-  # Lets you click "Run workflow" in GitHub UI to test any time
   workflow_dispatch:
+
+# Allow the workflow to write back seen_jobs.json to the repo
+permissions:
+  contents: write
 
 jobs:
   hunt:
@@ -16,6 +18,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -34,6 +38,16 @@ jobs:
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
           EMAIL_CC:        ${{ secrets.EMAIL_CC }}
         run: python job_hunter.py
+
+      - name: Commit seen_jobs.json cache
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name  "github-actions[bot]"
+          git add seen_jobs.json
+          git diff --staged --quiet || git commit -m "chore: update seen jobs cache [skip ci]"
+          git push
+        # This step succeeds even if there's nothing to commit
+        continue-on-error: true
 
       - name: Upload HTML report as artifact
         if: always()

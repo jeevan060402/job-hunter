@@ -319,44 +319,38 @@ def filter_jobs(jobs: List[Dict]) -> List[Dict]:
 # GEMINI SCORING  (100% FREE)
 # ─────────────────────────────────────────────
 
-def score_jobs_with_gemini(jobs: List[Dict]) -> Dict:
+def score_jobs_with_gemini(jobs):
+    from groq import Groq
+
     if not CONFIG["gemini_api_key"]:
-        raise ValueError(
-            "GEMINI_API_KEY is not set.\n"
-            "Get a free key at https://aistudio.google.com → 'Get API key'\n"
-            "Then export GEMINI_API_KEY=your_key_here"
-        )
+        raise ValueError("GROQ_API_KEY is not set.")
 
-    genai.configure(api_key=CONFIG["gemini_api_key"])
-
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",   # free tier: 1M tokens/day, 15 RPM
-        system_instruction=SYSTEM_PROMPT,
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.2,   # low temp = consistent JSON output
-            max_output_tokens=4096,
-        ),
-    )
+    client = Groq(api_key=CONFIG["gemini_api_key"])  # reusing same config key
 
     today   = datetime.date.today().isoformat()
     payload = json.dumps(jobs, indent=2, ensure_ascii=False)
     prompt  = f"Today is {today}.\n\nHere are today's scraped job listings:\n\n{payload}"
 
-    log.info(f"Sending {len(jobs)} jobs to Gemini Flash for scoring…")
-    response = model.generate_content(prompt)
-    raw      = response.text.strip()
+    log.info(f"Sending {len(jobs)} jobs to Groq (Llama 3.3) for scoring…")
 
-    # Strip any accidental markdown fences
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=4096,
+    )
+
+    raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
     result = json.loads(raw)
-    log.info(
-        f"Gemini returned: {result.get('total_evaluated','?')} evaluated, "
-        f"{result.get('high_priority_count','?')} HIGH"
-    )
+    log.info(f"Groq returned: {result.get('total_evaluated','?')} evaluated, "
+             f"{result.get('high_priority_count','?')} HIGH")
     return result
-
 
 # ─────────────────────────────────────────────
 # HTML EMAIL REPORT

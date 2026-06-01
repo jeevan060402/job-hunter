@@ -601,18 +601,90 @@ def filter_jobs(jobs: List[Dict]) -> List[Dict]:
 # GROQ SCORING
 # ─────────────────────────────────────────────
 
+def _slim_for_scoring(jobs: List[Dict]) -> List[Dict]:
+    """
+    Return a minimal copy of each job for the Groq scoring payload.
+
+    Design rationale — two separate concerns:
+      • Full job dict  → stored in archive JSON, rendered in HTML email (needs 800-char desc)
+      • Slim job dict  → sent to Groq for scoring (only needs what the model reads to score)
+
+    Token budget for Groq free tier (llama-3.3-70b-versatile):
+      Limit            : 12,000 TPM
+      System prompt    : ~1,200 tokens
+      Output budget    : ~1,500 tokens (JSON scoring response)
+      Available for jobs: 12,000 - 1,200 - 1,500 = 9,300 tokens
+      Target job count : 20 jobs
+      Budget per job   : 9,300 / 20 = 465 tokens
+      Non-desc fields  : ~65 tokens (title + company + location + tags + salary)
+      Description cap  : 400 tokens → 400 × 4 chars = 1,600 chars, use 250 for safety margin
+
+    Groq only needs the first 250 chars of description to score:
+    the key requirements are always in the opening lines of a JD.
+    """
+    slim = []
+    for j in jobs:
+        slim.append({
+            "title":       j.get("title", ""),
+            "company":     j.get("company", ""),
+            "location":    j.get("location", ""),
+            "tags":        j.get("tags", ""),
+            "salary":      j.get("salary", ""),
+            "description": j.get("description", "")[:250],   # key requirements only
+            "url":         j.get("url", ""),                  # needed for apply_url in output
+            "source":      j.get("source", ""),
+        })
+    return slim
+
+
+def _estimate_tokens(text: str) -> int:
+    """Conservative token estimate: 1 token per 3.5 chars (Llama tokeniser is denser than GPT)."""
+    return int(len(text) / 3.5)
+
+
 def score_jobs_with_groq(jobs: List[Dict]) -> Dict:
     if not CONFIG["groq_api_key"]:
         raise ValueError(
             "GROQ_API_KEY not set. Get a free key at https://console.groq.com"
         )
 
-    client  = Groq(api_key=CONFIG["groq_api_key"])
-    today   = datetime.date.today().isoformat()
-    payload = json.dumps(jobs, indent=2, ensure_ascii=False)
-    prompt  = f"Today is {today}.\n\nHere are today's NEW job listings:\n\n{payload}"
+    # ── Pre-flight token check ─────────────────────────────────
+    GROQ_TPM_LIMIT   = 12_000
+    OUTPUT_BUDGET    = 1_500
+    SAFE_INPUT_LIMIT = GROQ_TPM_LIMIT - OUTPUT_BUDGET   # 10,500
 
-    log.info(f"Sending {len(jobs)} jobs to Groq (Llama 3.3-70b)…")
+    slim_jobs    = _slim_for_scoring(jobs)
+    today        = datetime.date.today().isoformat()
+    payload      = json.dumps(slim_jobs, indent=2, ensure_ascii=False)
+    prompt       = f"Today is {today}.\n\nHere are today's NEW job listings:\n\n{payload}"
+
+    total_input_tokens = _estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(prompt)
+
+    log.info(
+        f"Token estimate — system: {_estimate_tokens(SYSTEM_PROMPT)} | "
+        f"jobs payload: {_estimate_tokens(prompt)} | "
+        f"total: {total_input_tokens} / {SAFE_INPUT_LIMIT} limit"
+    )
+
+    if total_input_tokens > SAFE_INPUT_LIMIT:
+        # Auto-reduce: trim to however many jobs fit safely
+        chars_per_job    = len(payload) / max(len(slim_jobs), 1)
+        tokens_per_job   = chars_per_job / 3.5
+        safe_n           = int(
+            (SAFE_INPUT_LIMIT - _estimate_tokens(SYSTEM_PROMPT) - 200) / tokens_per_job
+        )
+        safe_n           = max(5, min(safe_n, len(slim_jobs)))
+        log.warning(
+            f"Payload too large ({total_input_tokens} est. tokens). "
+            f"Auto-trimming from {len(slim_jobs)} → {safe_n} jobs."
+        )
+        slim_jobs  = slim_jobs[:safe_n]
+        payload    = json.dumps(slim_jobs, indent=2, ensure_ascii=False)
+        prompt     = f"Today is {today}.\n\nHere are today's NEW job listings:\n\n{payload}"
+    # ──────────────────────────────────────────────────────────
+
+    client = Groq(api_key=CONFIG["groq_api_key"])
+    log.info(f"Sending {len(slim_jobs)} jobs to Groq (Llama 3.3-70b)…")
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -621,7 +693,7 @@ def score_jobs_with_groq(jobs: List[Dict]) -> Dict:
             {"role": "user",   "content": prompt},
         ],
         temperature=0.2,
-        max_tokens=4096,
+        max_tokens=1500,   # matches OUTPUT_BUDGET above
     )
 
     raw = response.choices[0].message.content.strip()
@@ -913,8 +985,10 @@ def run():
             log.error(f"Email failed: {e}")
         return
 
-    # Cap at 40 for Groq
-    jobs = jobs[:40]
+    # Cap at 20 — score_jobs_with_groq has a pre-flight token check that
+    # will auto-trim further if needed, but 20 × slim payload stays well
+    # under the 10,500-token safe input budget.
+    jobs = jobs[:20]
     log.info(f"Sending {len(jobs)} new jobs to Groq")
 
     # 5. Score with Groq

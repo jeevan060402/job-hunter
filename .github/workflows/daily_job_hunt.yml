@@ -24,7 +24,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install google-generativeai requests
+        run: pip install groq requests
 
       - name: Run job hunter
         env:

@@ -322,10 +322,10 @@ def filter_jobs(jobs: List[Dict]) -> List[Dict]:
 def score_jobs_with_gemini(jobs):
     from groq import Groq
 
-    if not CONFIG["gemini_api_key"]:
+    if not CONFIG["GROQ_API_KEY"]:
         raise ValueError("GROQ_API_KEY is not set.")
 
-    client = Groq(api_key=CONFIG["gemini_api_key"])  # reusing same config key
+    client = Groq(api_key=CONFIG["GROQ_API_KEY"])  # reusing same config key
 
     today   = datetime.date.today().isoformat()
     payload = json.dumps(jobs, indent=2, ensure_ascii=False)

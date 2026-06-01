@@ -256,7 +256,7 @@ def fetch_arbeitnow() -> List[Dict]:
 
 
 def fetch_naukri_rss() -> List[Dict]:
-    """Naukri RSS — uses feedparser which tolerates Naukri's malformed XML."""
+    """Naukri RSS — requests fetches with timeout, feedparser parses content."""
     jobs = []
     feeds = [
         "https://www.naukri.com/rss/jobs/python-developer-jobs-in-hyderabad.rss",
@@ -264,9 +264,12 @@ def fetch_naukri_rss() -> List[Dict]:
         "https://www.naukri.com/rss/jobs/python-developer-jobs-in-india.rss",
         "https://www.naukri.com/rss/jobs/kubernetes-engineer-jobs-in-india.rss",
     ]
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; JobHunterBot/1.0)"}
     for url in feeds:
         try:
-            feed = feedparser.parse(url)
+            r = requests.get(url, headers=headers, timeout=8)  # hard 8s timeout
+            r.raise_for_status()
+            feed = feedparser.parse(r.content)                  # parse already-fetched bytes
             for entry in feed.entries[:8]:
                 jobs.append({
                     "source":      "Naukri",
@@ -281,11 +284,12 @@ def fetch_naukri_rss() -> List[Dict]:
                 })
             log.info(f"Naukri [{url.split('/')[-1]}]: {len(feed.entries)} entries")
             time.sleep(1)
+        except requests.exceptions.Timeout:
+            log.warning(f"Naukri RSS timeout (skipping): {url}")
         except Exception as e:
             log.warning(f"Naukri RSS {url}: {e}")
     log.info(f"Naukri total: {len(jobs)} jobs")
     return jobs
-
 
 # ─────────────────────────────────────────────
 # FILTERING
